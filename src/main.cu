@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -99,6 +100,61 @@ struct CheckStats {
 static void cuda_check(cudaError_t err) {
     if (err != cudaSuccess)
         throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(err));
+}
+
+static void write_npy_header(std::ofstream& out, int rows, int cols) {
+    const char magic[] = "\x93NUMPY";
+    out.write(magic, 6);
+    const unsigned char version[2] = {1, 0};
+    out.write(reinterpret_cast<const char*>(version), 2);
+    std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': (" +
+        std::to_string(rows) + ", " + std::to_string(cols) + "), }";
+    const size_t preamble = 10;
+    size_t pad = 16 - ((preamble + header.size() + 1) % 16);
+    if (pad == 16) pad = 0;
+    header.append(pad, ' ');
+    header.push_back('\n');
+    if (header.size() > 65535) {
+        throw std::runtime_error("NumPy header too large");
+    }
+    const uint16_t header_len = static_cast<uint16_t>(header.size());
+    out.put(static_cast<char>(header_len & 0xff));
+    out.put(static_cast<char>((header_len >> 8) & 0xff));
+    out.write(header.data(), header.size());
+}
+
+static void dump_magnitude_npy(const char* path, const SparseFFTResult& result,
+                               int rows, int cols) {
+    const int freq_cols = cols / 2 + 1;
+    const size_t n_freq = (size_t)rows * freq_cols;
+    std::vector<cuFloatComplex> host;
+    const cuFloatComplex* freq = nullptr;
+    if (!result.h_output.empty()) {
+        freq = result.h_output.data();
+    } else if (result.d_output) {
+        host.resize(n_freq);
+        cuda_check(cudaMemcpy(host.data(), result.d_output,
+                              n_freq * sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
+        freq = host.data();
+    } else {
+        throw std::runtime_error("no cuSpFFT output available to dump");
+    }
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error(std::string("failed to open dump output: ") + path);
+    }
+    write_npy_header(out, rows, freq_cols);
+    std::vector<float> row(freq_cols);
+    for (int r = 0; r < rows; ++r) {
+        const cuFloatComplex* src = freq + (size_t)r * result.output_cols;
+        for (int c = 0; c < freq_cols; ++c) {
+            const float x = src[c].x;
+            const float y = src[c].y;
+            row[c] = std::sqrt(x * x + y * y);
+        }
+        out.write(reinterpret_cast<const char*>(row.data()), row.size() * sizeof(float));
+    }
 }
 
 static DenseReference make_dense_reference(const DenseFFTResult& dense, int rows, int cols) {
@@ -270,6 +326,7 @@ int main(int argc, char** argv) {
     bool csc_mixed_radix_graph = false;
     bool csc_cufft_smooth = false;
     bool run_cpu_ref = false;
+    std::string dump_mag_path;
     int csc_tile     = 1024;
     int repeat_iters = 1;
 
@@ -291,6 +348,11 @@ int main(int argc, char** argv) {
         else if (f == "--csc-mixed-radix-graph") csc_mixed_radix_graph = true;
         else if (f == "--csc-cufft-smooth") csc_cufft_smooth = true;
         else if (f == "--cpu-reference") run_cpu_ref = true;
+        else if (f == "--dump-mag") {
+            if (++i >= argc)
+                throw std::runtime_error("--dump-mag requires an output .npy path");
+            dump_mag_path = argv[i];
+        }
         else if (f == "--csc-tile") {
             if (++i >= argc)
                 throw std::runtime_error("--csc-tile requires an integer value");
@@ -317,6 +379,14 @@ int main(int argc, char** argv) {
         printf("nnz:    %d  (density %.4f%%)\n\n",
                coo.nnz,
                100.0 * coo.nnz / ((double)coo.rows * coo.cols));
+
+        if (!dump_mag_path.empty()) {
+            SparseFFTResult sc = sparse_fft_csc_bluestein_cufft_streaming(coo, csc_tile);
+            dump_magnitude_npy(dump_mag_path.c_str(), sc, coo.rows, coo.cols);
+            printf("Dumped cuSpFFT magnitude: %s  (%d x %d)\n",
+                   dump_mag_path.c_str(), coo.rows, coo.cols / 2 + 1);
+            return 0;
+        }
 
         print_separator();
         DenseReference dense_ref;
